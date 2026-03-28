@@ -11,9 +11,12 @@ $ErrorActionPreference = 'Stop'
 
 # Force TLS 1.2/1.3 — Windows 10 sometimes defaults to TLS 1.0/1.1,
 # which cli.coderabbit.ai rejects, causing SChannel negotiation failures.
-[Net.ServicePointManager]::SecurityProtocol =
-    [Net.SecurityProtocolType]::Tls12 -bor
-    [Net.SecurityProtocolType]::Tls13
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls13
+} catch {
+    # TLS 1.3 not available on this .NET version; TLS 1.2 will be used
+}
 
 # ---------------------------------------------------------------------------
 # Download helpers — try SChannel first, then curl.exe, then bun (BoringSSL)
