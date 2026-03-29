@@ -29,7 +29,7 @@ function Invoke-DownloadString {
     try {
         return (Invoke-WebRequest -Uri $Uri -UseBasicParsing -ErrorAction Stop).Content.Trim()
     } catch {
-        Write-Host "  [~] SChannel failed for string download, trying curl.exe..." -ForegroundColor DarkYellow
+        Write-Host "  [~] Invoke-WebRequest failed for string download, trying curl.exe..." -ForegroundColor DarkYellow
     }
 
     # Attempt 2: curl.exe — ships with Windows 10 1803+
@@ -151,7 +151,7 @@ if (Test-Path $ExePath) {
         Write-Host "v$LatestVersion" -ForegroundColor Green
     }
 } else {
-    Write-Host "Installing version: " -NoNewline
+    Write-Host "`n[*] Installing version: " -NoNewline
     Write-Host "v$LatestVersion" -ForegroundColor Green
 }
 
@@ -167,13 +167,14 @@ $TempDir = Join-Path $InstallDir "temp_build_$LatestVersion"
 New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 
-# --- 3. Fast Download with Progress Bar ---
+# --- 3. Fast Download with Progress Bar + Extract ---
 Write-Host "`n[*] Downloading official CodeRabbit CLI (Linux Payload)..."
 $ZipUrl = "https://cli.coderabbit.ai/releases/latest/coderabbit-linux-x64.zip"
 $ZipPath = Join-Path $TempDir "coderabbit-linux-x64.zip"
 
 Invoke-DownloadFile -Uri $ZipUrl -Destination $ZipPath -DisplayName "Downloading CodeRabbit payload..."
 
+Write-Host "`n[*] Extracting downloaded payload archive..."
 Expand-Archive -Path $ZipPath -DestinationPath $TempDir -Force
 $LinuxBinary = Join-Path $TempDir "coderabbit"
 
@@ -189,7 +190,7 @@ if (-not (Test-Path $DecompiledDir)) {
 }
 
 # --- 5. Resolve dependencies and compile ---
-Write-Host "[*] Compiling native Windows executable..."
+Write-Host "`n[*] Compiling native Windows executable..."
 Set-Location $DecompiledDir
 bun install --silent
 bun build index.js --compile --target=bun-windows-x64 --outfile=$ExePath
@@ -201,6 +202,7 @@ if (-not (Test-Path $ExePath)) {
 Copy-Item -Path $ExePath -Destination (Join-Path $BinDir "cr.exe") -Force
 
 # --- 6. Add to PATH ---
+Write-Host "`n[*] Adding executable to PATH..."
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 if (($userPath -split ';') -notcontains $BinDir) {
     $newPath = if ([string]::IsNullOrWhiteSpace($userPath)) { $BinDir } else { "$userPath;$BinDir" }
@@ -209,6 +211,7 @@ if (($userPath -split ';') -notcontains $BinDir) {
 }
 
 # --- 7. Cleanup ---
+Write-Host "`n[*] Cleaning up temporary files..."
 Set-Location $env:USERPROFILE
 Remove-Item -Path $TempDir -Recurse -Force -ErrorAction SilentlyContinue
 
