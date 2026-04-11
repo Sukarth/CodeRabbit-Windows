@@ -33,10 +33,6 @@ function Invoke-DownloadString {
     }
 
     # Attempt 2: curl.exe — ships with Windows 10 1803+
-    # Note: Windows curl.exe also uses SChannel; the try/catch ensures failure
-    # does not terminate the script (ErrorActionPreference=Stop + native stderr
-    # = terminating error without a catch). Use 2>&1 to keep stderr out of
-    # PowerShell's error stream.
     if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
         try {
             $out = (& curl.exe -fsL $Uri 2>&1) | Where-Object { $_ -is [string] }
@@ -48,7 +44,7 @@ function Invoke-DownloadString {
     # Attempt 3: bun — prerequisite, bundles BoringSSL (OpenSSL-compatible)
     if (Get-Command bun -ErrorAction SilentlyContinue) {
         try {
-			$jsUri = $Uri -replace '\\', '\\\\' -replace "'", "\'"
+            $jsUri = $Uri -replace '\\', '\\\\' -replace "'", "\'"
             $out = (& bun -e "fetch('$jsUri').then(r=>r.text()).then(t=>process.stdout.write(t.trim()))" 2>&1) |
                        Where-Object { $_ -is [string] }
             if ($LASTEXITCODE -eq 0 -and $out) { return ($out -join '').Trim() }
@@ -78,8 +74,7 @@ function Invoke-DownloadFile {
         Write-Host "  [~] Invoke-WebRequest failed, trying curl.exe..." -ForegroundColor DarkYellow
     }
 
-    # Attempt 3: curl.exe — try/catch + 2>&1 prevents ErrorActionPreference=Stop
-    # from treating curl's stderr as a terminating error.
+    # Attempt 3: curl.exe
     if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
         try {
             $null = & curl.exe -fsL -o $Destination $Uri 2>&1
@@ -91,9 +86,8 @@ function Invoke-DownloadFile {
     # Attempt 4: bun (BoringSSL — works even when SChannel cipher negotiation fails)
     if (Get-Command bun -ErrorAction SilentlyContinue) {
         try {
-            # Escape backslashes for the JS string literal
             $jsDest = $Destination -replace '\\', '\\\\'
-			$jsUri = $Uri -replace '\\', '\\\\' -replace "'", "\'"
+            $jsUri  = $Uri         -replace '\\', '\\\\' -replace "'", "\'"
             $null = & bun -e @"
 const r = await fetch('$jsUri');
 if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -128,13 +122,13 @@ function Show-Banner {
 Show-Banner
 
 $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\CodeRabbit"
-$BinDir = Join-Path $InstallDir "bin"
-$ExePath = Join-Path $BinDir "coderabbit.exe"
+$BinDir     = Join-Path $InstallDir "bin"
+$ExePath    = Join-Path $BinDir "coderabbit.exe"
 
 # --- 1. Version Checking ---
 Write-Host "`n[*] Checking latest version..."
 $LatestVersionUrl = "https://cli.coderabbit.ai/releases/latest/VERSION"
-$LatestVersion = Invoke-DownloadString -Uri $LatestVersionUrl
+$LatestVersion    = Invoke-DownloadString -Uri $LatestVersionUrl
 
 if (Test-Path $ExePath) {
     $CurrentVersion = (& $ExePath --version 2>&1).Trim()
@@ -165,11 +159,11 @@ if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
 
 $TempDir = Join-Path $InstallDir "temp_build_$LatestVersion"
 New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
-New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+New-Item -ItemType Directory -Force -Path $BinDir  | Out-Null
 
-# --- 3. Fast Download with Progress Bar + Extract ---
+# --- 3. Download + Extract ---
 Write-Host "`n[*] Downloading official CodeRabbit CLI (Linux Payload)..."
-$ZipUrl = "https://cli.coderabbit.ai/releases/latest/coderabbit-linux-x64.zip"
+$ZipUrl  = "https://cli.coderabbit.ai/releases/latest/coderabbit-linux-x64.zip"
 $ZipPath = Join-Path $TempDir "coderabbit-linux-x64.zip"
 
 Invoke-DownloadFile -Uri $ZipUrl -Destination $ZipPath -DisplayName "Downloading CodeRabbit payload..."
@@ -182,7 +176,7 @@ $LinuxBinary = Join-Path $TempDir "coderabbit"
 Write-Host "`n[*] Unpacking CodeRabbit bundle natively..."
 Set-Location $TempDir
 bun install @shepherdjerred/bun-decompile --silent
-bunx @shepherdjerred/bun-decompile $LinuxBinary
+$decompileOutput = bunx @shepherdjerred/bun-decompile $LinuxBinary 2>&1 | Out-String
 
 $DecompiledDir = Join-Path $TempDir "decompiled\bundled"
 if (-not (Test-Path $DecompiledDir)) {
@@ -192,11 +186,51 @@ if (-not (Test-Path $DecompiledDir)) {
 # --- 5. Resolve dependencies and compile ---
 Write-Host "`n[*] Compiling native Windows executable..."
 Set-Location $DecompiledDir
-bun install --silent
-bun build index.js --compile --target=bun-windows-x64 --outfile=$ExePath
 
-if (-not (Test-Path $ExePath)) {
-    Write-Error "Failed to compile the Windows executable."
+# Detect actual entry point from decompiler output
+$EntryPoint = $null
+if ($decompileOutput -match "Entry point:\s*/(.+\.js)") {
+    $candidate = $Matches[1].Trim()
+    if (Test-Path (Join-Path $DecompiledDir $candidate)) {
+        $EntryPoint = $candidate
+    }
+}
+# Fallbacks in priority order
+if (-not $EntryPoint) {
+    Write-Host "  [~] Could not auto-detect entry point. Attempting fallbacks..." -ForegroundColor DarkYellow
+    foreach ($name in @("cli.js", "index.js", "main.js")) {
+        if (Test-Path (Join-Path $DecompiledDir $name)) { $EntryPoint = $name; break }
+    }
+}
+if (-not $EntryPoint) {
+    $EntryPoint = Get-ChildItem $DecompiledDir -Filter "*.js" -File |
+                  Select-Object -First 1 -ExpandProperty Name
+}
+if (-not $EntryPoint) {
+    Write-Error "Could not determine entry point JS file in decompiled output."
+}
+
+Write-Host "  [~] Using entry point: $EntryPoint" -ForegroundColor DarkYellow
+
+bun install --silent
+bun build $EntryPoint --compile --target=bun-windows-x64 --outfile=$ExePath
+
+# --- 5a. Post-compile version verification ---
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $ExePath)) {
+    Write-Error "Compilation failed: bun exited with code $LASTEXITCODE and no executable was produced."
+}
+
+$CompiledVersion = (& $ExePath --version 2>&1).Trim()
+if ($CompiledVersion -ne $LatestVersion) {
+    Write-Host ""
+    Write-Host "  [!] Version mismatch after compilation!" -ForegroundColor Red
+    Write-Host "      Expected : v$LatestVersion"          -ForegroundColor Red
+    Write-Host "      Got      : $CompiledVersion"         -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  The temp build folder has been kept for debugging at:" -ForegroundColor DarkYellow
+    Write-Host "  $TempDir"                                              -ForegroundColor DarkYellow
+    Write-Host ""
+    Write-Error "Installation aborted: compiled binary reported wrong version."
 }
 
 Copy-Item -Path $ExePath -Destination (Join-Path $BinDir "cr.exe") -Force
