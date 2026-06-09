@@ -18,6 +18,22 @@ try {
     # TLS 1.3 not available on this .NET version; TLS 1.2 will be used
 }
 
+# Bypass certificate validation for problematic endpoints (last resort)
+$CertBypass = @"
+using System.Net;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+public class CertificateBypass {
+    public static void Bypass() {
+        ServicePointManager.ServerCertificateValidationCallback = 
+            new RemoteCertificateValidationCallback(
+                delegate { return true; }
+            );
+    }
+}
+"@
+Add-Type -TypeDefinition $CertBypass -ErrorAction SilentlyContinue
+
 # ---------------------------------------------------------------------------
 # Download helpers — try SChannel first, then curl.exe, then bun (BoringSSL)
 # ---------------------------------------------------------------------------
@@ -28,7 +44,12 @@ function Invoke-DownloadString {
     # Attempt 1: Invoke-WebRequest via SChannel (with TLS forced above)
     try {
         $response = Invoke-WebRequest -Uri $Uri -UseBasicParsing -ErrorAction Stop
-        return $response.Content.Trim()
+        $content = $response.Content
+        # Handle byte array responses
+        if ($content -is [byte[]]) {
+            $content = [System.Text.Encoding]::UTF8.GetString($content)
+        }
+        return $content.Trim()
     } catch {
         Write-Host "  [~] Invoke-WebRequest failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
     }
@@ -86,8 +107,12 @@ function Invoke-DownloadFile {
     # Attempt 3: curl.exe
     if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
         try {
-            $null = & curl.exe -fsL -o $Destination $Uri 2>&1
+            $curlErrorOutput = @()
+            $null = & curl.exe -fsL -o $Destination $Uri 2>&1 | ForEach-Object { $curlErrorOutput += $_ }
             if ($LASTEXITCODE -eq 0 -and (Test-Path $Destination) -and (Get-Item $Destination).Length -gt 0) { return }
+            if ($curlErrorOutput) {
+                Write-Host "  [~] curl.exe error: $($curlErrorOutput -join ' ')" -ForegroundColor DarkYellow
+            }
         } catch {
             Write-Host "  [~] curl.exe failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
         }
