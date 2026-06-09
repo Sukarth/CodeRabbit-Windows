@@ -27,28 +27,37 @@ function Invoke-DownloadString {
 
     # Attempt 1: Invoke-WebRequest via SChannel (with TLS forced above)
     try {
-        return (Invoke-WebRequest -Uri $Uri -UseBasicParsing -ErrorAction Stop).Content.Trim()
+        $response = Invoke-WebRequest -Uri $Uri -UseBasicParsing -ErrorAction Stop
+        return $response.Content.Trim()
     } catch {
-        Write-Host "  [~] Invoke-WebRequest failed for string download, trying curl.exe..." -ForegroundColor DarkYellow
+        Write-Host "  [~] Invoke-WebRequest failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
     }
 
     # Attempt 2: curl.exe — ships with Windows 10 1803+
     if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
         try {
-            $out = (& curl.exe -fsL $Uri 2>&1) | Where-Object { $_ -is [string] }
-            if ($LASTEXITCODE -eq 0 -and $out) { return ($out -join '').Trim() }
-        } catch {}
-        Write-Host "  [~] curl.exe failed, trying bun fetch..." -ForegroundColor DarkYellow
+            $curlOutput = @()
+            & curl.exe -fsL $Uri 2>&1 | ForEach-Object { $curlOutput += $_ }
+            if ($LASTEXITCODE -eq 0 -and $curlOutput) { 
+                return ($curlOutput -join '').Trim() 
+            }
+        } catch {
+            Write-Host "  [~] curl.exe failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
+        }
     }
 
     # Attempt 3: bun — prerequisite, bundles BoringSSL (OpenSSL-compatible)
     if (Get-Command bun -ErrorAction SilentlyContinue) {
         try {
             $jsUri = $Uri -replace '\\', '\\\\' -replace "'", "\'"
-            $out = (& bun -e "fetch('$jsUri').then(r=>r.text()).then(t=>process.stdout.write(t.trim()))" 2>&1) |
-                       Where-Object { $_ -is [string] }
-            if ($LASTEXITCODE -eq 0 -and $out) { return ($out -join '').Trim() }
-        } catch {}
+            $bunOutput = @()
+            & bun -e "fetch('$jsUri').then(r=>r.text()).then(t=>process.stdout.write(t.trim()))" 2>&1 | ForEach-Object { $bunOutput += $_ }
+            if ($LASTEXITCODE -eq 0 -and $bunOutput) { 
+                return ($bunOutput -join '').Trim() 
+            }
+        } catch {
+            Write-Host "  [~] bun fetch failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
+        }
     }
 
     throw "All download methods failed for: $Uri"
@@ -63,7 +72,7 @@ function Invoke-DownloadFile {
         Start-BitsTransfer -Source $Uri -Destination $Destination -DisplayName $DisplayName -ErrorAction Stop
         if ((Test-Path $Destination) -and (Get-Item $Destination).Length -gt 0) { return }
     } catch {
-        Write-Host "  [~] BITS transfer failed, trying Invoke-WebRequest..." -ForegroundColor DarkYellow
+        Write-Host "  [~] BITS transfer failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
     }
 
     # Attempt 2: Invoke-WebRequest via SChannel
@@ -71,7 +80,7 @@ function Invoke-DownloadFile {
         Invoke-WebRequest -Uri $Uri -OutFile $Destination -UseBasicParsing -ErrorAction Stop
         if ((Test-Path $Destination) -and (Get-Item $Destination).Length -gt 0) { return }
     } catch {
-        Write-Host "  [~] Invoke-WebRequest failed, trying curl.exe..." -ForegroundColor DarkYellow
+        Write-Host "  [~] Invoke-WebRequest failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
     }
 
     # Attempt 3: curl.exe
@@ -79,8 +88,9 @@ function Invoke-DownloadFile {
         try {
             $null = & curl.exe -fsL -o $Destination $Uri 2>&1
             if ($LASTEXITCODE -eq 0 -and (Test-Path $Destination) -and (Get-Item $Destination).Length -gt 0) { return }
-        } catch {}
-        Write-Host "  [~] curl.exe failed, trying bun fetch..." -ForegroundColor DarkYellow
+        } catch {
+            Write-Host "  [~] curl.exe failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
+        }
     }
 
     # Attempt 4: bun (BoringSSL — works even when SChannel cipher negotiation fails)
@@ -95,7 +105,9 @@ const buf = await r.arrayBuffer();
 require('fs').writeFileSync('$jsDest', Buffer.from(buf));
 "@ 2>&1
             if ((Test-Path $Destination) -and (Get-Item $Destination).Length -gt 0) { return }
-        } catch {}
+        } catch {
+            Write-Host "  [~] bun fetch failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
+        }
     }
 
     throw "All download methods failed for: $Uri -> $Destination"
