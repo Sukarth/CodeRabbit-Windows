@@ -114,6 +114,23 @@ require('fs').writeFileSync('$jsDest', Buffer.from(buf));
 
 # ---------------------------------------------------------------------------
 
+# Returns "" for any exe that cannot report a version. Under Windows
+# PowerShell 5.1 with ErrorActionPreference = 'Stop', a native command that
+# writes to stderr or fails to start throws instead of returning, which would
+# abort the script before a broken install could be replaced.
+function Get-ExeVersion {
+    param([string]$Path)
+
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & $Path --version 2>$null
+        if ($LASTEXITCODE -ne 0) { return "" }
+        return "$output".Trim()
+    } catch {
+        return ""
+    }
+}
+
 function Show-Banner {
     Write-Host "==========================================================================" -ForegroundColor Blue
     $banner = @"
@@ -142,9 +159,12 @@ $LatestVersionUrl = "https://cli.coderabbit.ai/releases/latest/VERSION"
 $LatestVersion    = Invoke-DownloadString -Uri $LatestVersionUrl
 
 if (Test-Path $ExePath) {
-    $CurrentVersion = (& $ExePath --version 2>&1).Trim()
+    $CurrentVersion = Get-ExeVersion -Path $ExePath
 
-    if ($CurrentVersion -eq $LatestVersion) {
+    if (-not $CurrentVersion) {
+        Write-Host "Existing install is broken (no version reported). Reinstalling " -NoNewline
+        Write-Host "v$LatestVersion" -ForegroundColor Green
+    } elseif ($CurrentVersion -eq $LatestVersion) {
         Write-Host "You already have the latest version installed: " -NoNewline
         Write-Host "v$CurrentVersion" -ForegroundColor Green
         Write-Host "`nInstallation skipped. Your CLI is up to date!"
@@ -227,28 +247,99 @@ try {
     # --- 4. Decompile Binary ---
     Write-Host "`n[*] Unpacking CodeRabbit bundle natively..."
     Set-Location $TempDir
-    # Pinned to an exact tested version: a floating spec would silently pull new
-    # decompiler code into the binary this script compiles and installs.
-    $DecompilerPackage = "@andrewgross/bun-decompile@0.1.1"
     $DecompiledDir = Join-Path $TempDir "decompiled"
 
     # $TempDir survives a re-run for the same version, so clear any previous
     # output first; otherwise a failed decompile leaves stale files that pass
-    # the Test-Path check below and get compiled instead.
+    # the checks below and get compiled instead.
     if (Test-Path $DecompiledDir) {
         Remove-Item -Path $DecompiledDir -Recurse -Force
     }
 
-    $decompileOutput = bunx $DecompilerPackage $LinuxBinary --output $DecompiledDir 2>&1 | Out-String
+    # Replaces @andrewgross/bun-decompile@0.1.1, which on Bun 1.4 payloads
+    # writes an empty index.js and exits 0: it assumes module contents follow
+    # the path, but 1.4 stores them first (the metadata pointers are absolute)
+    # and encodes them as UTF-16LE. Only the ELF .bun section with the 32-byte
+    # Offsets struct and 52-byte module records is supported; anything else
+    # throws rather than producing a bad build.
+    $ExtractorPath = Join-Path $TempDir "extract-bun-payload.js"
+    Set-Content -Path $ExtractorPath -Encoding ASCII -Value @'
+import { readFileSync, writeFileSync, mkdirSync } from "fs";
+import { resolve, relative, isAbsolute, dirname, sep } from "path";
+
+const [binaryPath, outDir] = process.argv.slice(2);
+const buf = readFileSync(binaryPath);
+const bin = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+
+if (bin.getUint32(0, true) !== 0x464c457f) throw new Error("not an ELF binary");
+const shoff = Number(bin.getBigUint64(40, true));
+const shentsize = bin.getUint16(58, true);
+const shnum = bin.getUint16(60, true);
+const strHdr = shoff + bin.getUint16(62, true) * shentsize;
+const strTab = Number(bin.getBigUint64(strHdr + 24, true));
+let section;
+for (let i = 0; i < shnum && !section; i++) {
+  const sh = shoff + i * shentsize;
+  const nameAt = strTab + bin.getUint32(sh, true);
+  if (buf.toString("latin1", nameAt, nameAt + 5) === ".bun\0") {
+    section = { offset: Number(bin.getBigUint64(sh + 24, true)), size: Number(bin.getBigUint64(sh + 32, true)) };
+  }
+}
+if (!section) throw new Error("no .bun section in binary");
+
+const TRAILER = "\n---- Bun! ----\n";
+const trailerAt = section.size - TRAILER.length;
+if (buf.toString("latin1", section.offset + trailerAt, section.offset + section.size) !== TRAILER) {
+  throw new Error(".bun section is missing the Bun trailer");
+}
+const v = new DataView(buf.buffer, buf.byteOffset + section.offset, section.size);
+
+const OFFSETS_SIZE = 32, CHUNK_SIZE = 52;
+const st = trailerAt - OFFSETS_SIZE;
+const byteCount = v.getUint32(st, true);
+const metaOffset = v.getUint32(st + 8, true);
+const metaLength = v.getUint32(st + 12, true);
+const entryId = v.getUint32(st + 16, true);
+const modulesStart = st - byteCount;
+if (modulesStart < 0 || metaLength === 0 || metaLength % CHUNK_SIZE !== 0 || entryId >= metaLength / CHUNK_SIZE) {
+  throw new Error("unrecognised Bun payload layout");
+}
+
+const slice = (off, len) => {
+  if (off + len > byteCount) throw new Error(`module pointer ${off}+${len} is outside the payload`);
+  const start = section.offset + modulesStart + off;
+  return buf.subarray(start, start + len);
+};
+const ENCODINGS = { 0: "binary", 1: "latin1", 2: "utf16le" };
+
+for (let i = 0; i < metaLength / CHUNK_SIZE; i++) {
+  const m = modulesStart + metaOffset + i * CHUNK_SIZE;
+  const path = slice(v.getUint32(m, true), v.getUint32(m + 4, true)).toString("utf8");
+  if (!path.startsWith("/$bunfs/root/")) throw new Error(`unexpected module path: ${path}`);
+  const raw = slice(v.getUint32(m + 8, true), v.getUint32(m + 12, true));
+  if (raw.length === 0) throw new Error(`module ${path} is empty`);
+  const encoding = ENCODINGS[v.getUint8(m + 48)];
+  if (!encoding) throw new Error(`module ${path} has unsupported encoding ${v.getUint8(m + 48)}`);
+  const rel = i === entryId ? "index.js" : path.slice("/$bunfs/root/".length);
+  const root = resolve(outDir);
+  const dest = resolve(root, rel);
+  const inside = relative(root, dest);
+  if (!inside || inside === ".." || inside.startsWith(".." + sep) || isAbsolute(inside)) {
+    throw new Error(`module path escapes the output directory: ${path}`);
+  }
+  mkdirSync(dirname(dest), { recursive: true });
+  writeFileSync(dest, encoding === "binary" ? raw : raw.toString(encoding));
+  console.log(`  ${rel} (${raw.length} bytes, ${encoding})`);
+}
+'@
+
+    $decompileOutput = bun $ExtractorPath $LinuxBinary $DecompiledDir 2>&1 | Out-String
 
     if ($LASTEXITCODE -ne 0) {
         Write-Host $decompileOutput
-        Write-Error "bun-decompile exited with code $LASTEXITCODE."
+        Write-Error "Bundle extraction exited with code $LASTEXITCODE."
     }
-    if (-not (Test-Path $DecompiledDir)) {
-        Write-Host $decompileOutput
-        Write-Error "Failed to decompile the CodeRabbit binary."
-    }
+    Write-Host $decompileOutput -ForegroundColor DarkGray
 
     # --- Process Locking Validation ---
     $runningProcesses = Get-Process -Name "cr", "coderabbit" -ErrorAction SilentlyContinue
@@ -268,31 +359,30 @@ try {
     Write-Host "`n[*] Compiling native Windows executable..."
     Set-Location $DecompiledDir
 
-    # bun-decompile normalizes the entrypoint to index.js unless --no-normalize
-    # is passed, so that name is authoritative. Every other .js file in the
-    # output is a bundled chunk; picking one by size or name would compile an
-    # arbitrary dependency into coderabbit.exe, so fail instead of guessing.
+    # The extractor always writes the entry module as index.js. Every other .js
+    # file in the output is a bundled chunk; picking one by size or name would
+    # compile an arbitrary dependency into coderabbit.exe, so fail instead of guessing.
     $EntryPoint = "index.js"
-    if (-not (Test-Path (Join-Path $DecompiledDir $EntryPoint))) {
-        Write-Host "  [!] Decompiled output has no $EntryPoint entry point." -ForegroundColor Red
-        Write-Host "   [~] Please inspect $DecompiledDir and report an issue at https://github.com/Sukarth/CodeRabbit-Windows/issues if this was unexpected."
-        Write-Error "Could not locate the bundle entry point."
+    $EntryFile = Join-Path $DecompiledDir $EntryPoint
+    if (-not (Test-Path $EntryFile) -or (Get-Item $EntryFile).Length -eq 0) {
+        Write-Error "Decompiled output has no usable $EntryPoint entry point; refusing to guess one. Inspect $DecompiledDir."
     }
 
-    Write-Host "  [~] Using entry point: $EntryPoint"
+    Write-Host "  [~] Using entry point: $EntryPoint" -ForegroundColor DarkYellow
 
     if (Test-Path (Join-Path $DecompiledDir "package.json")) {
         bun install --silent
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "bun install failed with exit code $LASTEXITCODE."
+        }
     }
-
-    $buildOutput = bun build $EntryPoint --compile --target=bun-windows-x64 --outfile=$ExePath 2>&1 | Out-String
+    bun build $EntryPoint --compile --target=bun-windows-x64 --outfile=$ExePath
 
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $ExePath)) {
-        Write-Host $buildOutput.TrimEnd()
         Write-Error "Compilation failed: bun exited with code $LASTEXITCODE and no executable was produced."
     }
 
-    $CompiledVersion = (& $ExePath --version 2>&1).Trim()
+    $CompiledVersion = Get-ExeVersion -Path $ExePath
     if ($CompiledVersion -ne $LatestVersion) {
         Write-Host ""
         Write-Host "  [!] Version mismatch after compilation!" -ForegroundColor Red
